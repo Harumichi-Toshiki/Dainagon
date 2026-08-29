@@ -9,7 +9,7 @@
 
 | バックエンド | 対象環境 | 状態 / 備考 |
 | :--- | :--- | :--- |
-| **ROCm (HIP)** | Linux / Windows (AMD Radeon RX 6000/7000/9000シリーズ) | **動作確認済み** (AMD GPU推奨) |
+| **ROCm (HIP)** | Linux / Windows (AMD Radeon RX 6000/7000/9000シリーズ) | **動作確認済み(RX9070XT)** (AMD GPU推奨) |
 | **DirectML** | Windows (AMD / Intel / NVIDIA GPU) | **動作確認済み** (Windows手軽設定) |
 | **CUDA** | Linux / Windows (NVIDIA GeForce/RTXシリーズ) | **未確認** (理論上動作可能) |
 | **CPU** | 汎用環境 | **未確認** (フォールバック用) |
