@@ -82,8 +82,6 @@ def main():
                               "--max-hoursと併用可、どちらか早く到達した方で停止する")
     parser.add_argument("--network", type=str, default="network.network_chunagon_v28.ChunagonNetV3")
     parser.add_argument("--eval-interval-sec", type=float, default=SAVE_INTERVAL_SEC)
-    parser.add_argument("--data-dir", type=str, default=DATA_DIR, help="訓練データのディレクトリパス (デフォルト: ./data/traindata)")
-    parser.add_argument("--val-dir", type=str, default=TEST_DATA_DIR, help="検証データのディレクトリパス (デフォルト: ./data/train_test)")
     args = parser.parse_args()
 
     if args.max_hours is None and args.max_steps is None:
@@ -92,22 +90,18 @@ def main():
     os.makedirs("model/checkpoints", exist_ok=True)
     os.makedirs("model/logs", exist_ok=True)
 
-    data_dir = args.data_dir
-    val_dir = args.val_dir
-
     ckpt_path = f"model/checkpoints/{args.test_id}.pt"
     jsonl_path = f"model/logs/{args.test_id}.jsonl"
 
     print(f"[INFO] test_id = {args.test_id}")
     print(f"[INFO] DEVICE = {DEVICE}  TunableOp enabled = {torch.cuda.tunable.is_enabled()}")
     print(f"[INFO] max_hours = {args.max_hours}  max_steps = {args.max_steps}  eval_interval_sec = {args.eval_interval_sec}")
-    print(f"[INFO] data_dir = {data_dir}  val_dir = {val_dir}")
     print(f"[INFO] network = {args.network}")
     print(f"[INFO] label_smoothing = {LABEL_SMOOTHING} (固定, P1-1由来)  VALUE_MIX_LAMBDA = {VALUE_MIX_LAMBDA}")
     print(f"[INFO] checkpoint -> {ckpt_path}")
     print(f"[INFO] jsonl log -> {jsonl_path}")
 
-    total_records, num_files = estimate_dataset_size(data_dir)
+    total_records, num_files = estimate_dataset_size(DATA_DIR)
     actual_positions_per_epoch = min(total_records, POSITIONS_PER_EPOCH)
     total_batches_per_epoch = actual_positions_per_epoch // PHYSICAL_BATCH_SIZE
     # 🚨 P1-5: total_opt_stepsはEPOCHSベースの計算式ではなく、実測(6時間で
@@ -117,9 +111,9 @@ def main():
     print(f"[INFO] 全データ: {num_files}ファイル / 推定{total_records:,}局面")
     print(f"[INFO] 総最適化ステップ数(スケジューラ用固定値): {total_opt_steps:,}")
 
-    dataset = MultiFileHCPEDataset(data_dir)
+    dataset = MultiFileHCPEDataset(DATA_DIR)
     loader = DataLoader(dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=NUM_WORKERS, persistent_workers=True)
-    val_dataset = ValidationDataset(val_dir)
+    val_dataset = ValidationDataset(TEST_DATA_DIR)
     val_loader = DataLoader(val_dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=0)
 
     model = get_network(args.network).to(DEVICE)

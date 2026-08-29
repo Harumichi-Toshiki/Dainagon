@@ -36,8 +36,8 @@ DEVICE = torch.device('cuda')
 # tunableop_results0.csv に永続化され、次回実行時は即座に再利用される。
 torch.cuda.tunable.enable(True)
 torch.cuda.tunable.tuning_enable(True)
-DATA_DIR = os.environ.get("DAINAGON_DATA_DIR", os.path.join("data", "traindata"))
-TEST_DATA_DIR = os.environ.get("DAINAGON_VAL_DIR", os.path.join("data", "train_test"))
+DATA_DIR = os.path.join("data", "traindata")
+TEST_DATA_DIR = os.path.join("data", "train_test")
 MODEL_SAVE_PATH = "model/chunagon_v30.pt" 
 GRAPH_SAVE_PATH = "model/learning_curve_v30.png" 
 
@@ -487,11 +487,8 @@ def plot_learning_curve(loss_history, save_path):
 def train(args):
     os.makedirs("model", exist_ok=True)
     
-    data_dir = getattr(args, "data_dir", None) or DATA_DIR
-    test_data_dir = getattr(args, "val_dir", None) or TEST_DATA_DIR
-
     # 全体容量の推定は情報として残す
-    total_records, num_files = estimate_dataset_size(data_dir)
+    total_records, num_files = estimate_dataset_size(DATA_DIR)
     
     # 🚨 学習の基準を POSITIONS_PER_EPOCH (1億) に固定する
     actual_positions_per_epoch = min(total_records, POSITIONS_PER_EPOCH)
@@ -506,9 +503,9 @@ def train(args):
 
     # データローダー
     NUM_WORKERS = 4
-    dataset = MultiFileHCPEDataset(data_dir)
+    dataset = MultiFileHCPEDataset(DATA_DIR)
     loader = DataLoader(dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=NUM_WORKERS, persistent_workers=(NUM_WORKERS>0))
-    val_dataset = ValidationDataset(test_data_dir)
+    val_dataset = ValidationDataset(TEST_DATA_DIR)
     val_loader = DataLoader(val_dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=0)
 
     # 🚀 ネットワークの動的ロード
@@ -647,15 +644,13 @@ def train(args):
                 gc.collect()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dainagon Training Script (ROCm)")
+    parser = argparse.ArgumentParser(description="Dainagon Training Script")
     parser.add_argument(
         "--network", 
         type=str, 
-        default="network.network_chunagon_v28.ChunagonNetV3",
-        help="ロードするネットワークのパス (例: network.network_chunagon_v28.ChunagonNetV3)"
+        default="network.network_chunagon_v30.ChunagonNetV3",
+        help="ロードするネットワークのパス (例: network.network_chunagon_v25.ChunagonNetV3)"
     )
-    parser.add_argument("--data-dir", type=str, default=DATA_DIR, help="訓練データのディレクトリパス (デフォルト: ./data/traindata)")
-    parser.add_argument("--val-dir", type=str, default=TEST_DATA_DIR, help="検証データのディレクトリパス (デフォルト: ./data/train_test)")
     parser.add_argument("--resume", action="store_true", help="チェックポイントから再開する")
     args = parser.parse_args()
 
