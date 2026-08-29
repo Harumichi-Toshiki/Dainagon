@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch_directml
 from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
 import os
 import math
 import copy
-import shogi
+import features
 import cshogi
 import struct
 import glob
@@ -27,30 +26,72 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serializ
 # ==========================================
 # ⚙️ グローバル設定
 # ==========================================
-DEVICE = torch_directml.device()
-DATA_DIR = r"E:\DainagonProject（E）\fine"
-TEST_DATA_DIR = r"C:\Users\harum\Desktop\MyProject\DainagonProject\data\train_test"
-MODEL_SAVE_PATH = "model/chunagon_v25_4.pt" 
-GRAPH_SAVE_PATH = "model/learning_curve_v25_4.png" 
+DEVICE = torch.device('cuda')
+
+# 🚨 ROCm(gfx120X系)はデフォルトのhipBLAS/rocBLASカーネル選択が最適でない
+# ことが確認されている(AMD ROCm issue #5674相当)。TunableOpのオンライン
+# チューニングを有効化することで、DirectML比 約1.08倍まで高速化する
+# (ベンチマーク済み: 1.7085 sec/step -> 1.1666 sec/step)。
+# 初回のみ未知の演算形状に対してチューニングコストが発生するが、結果は
+# tunableop_results0.csv に永続化され、次回実行時は即座に再利用される。
+torch.cuda.tunable.enable(True)
+torch.cuda.tunable.tuning_enable(True)
+DATA_DIR = os.environ.get("DAINAGON_DATA_DIR", os.path.join("data", "traindata"))
+TEST_DATA_DIR = os.environ.get("DAINAGON_VAL_DIR", os.path.join("data", "train_test"))
+MODEL_SAVE_PATH = "model/chunagon_v30.pt" 
+GRAPH_SAVE_PATH = "model/learning_curve_v30.png" 
 
 # ハイパーパラメータ
-EPOCHS              = 1
+EPOCHS              = 3
 INPUT_CHANNELS      = 55
-LEARNING_RATE       = 5e-6 #3e-4
+LEARNING_RATE       = 3e-4
 WEIGHT_DECAY        = 1e-3
-WARMUP_STEPS        = 0
+WARMUP_STEPS        = 800  # 🚨 P1-5: 2000 -> 800 (TOTAL_OPT_STEPSの約3.9%相当)
 ETA_MIN_RATIO       = 1e-3
+# 🚨 P1-5: これまでの全実験が6時間の壁時計学習で約20,583 optimizer.stepに
+# 収束している実測値に基づき、スケジューラの総ステップ数を固定値で与える
+# (EPOCHS×1エポック分のstep数という従来の計算式には依存させない)
+TOTAL_OPT_STEPS     = 20583
 TARGET_BATCH_SIZE   = 2048
 PHYSICAL_BATCH_SIZE = 256
 ACCUM_STEPS         = TARGET_BATCH_SIZE // PHYSICAL_BATCH_SIZE
 VALUE_LOSS_SCALE    = 1.5
+VALUE_MIX_LAMBDA    = 0.5  # 🚨 P1-2設計書§6: Binned Value / Result Head の混合比。固定値、自己判断で変更しない
 SAVE_INTERVAL_SEC   = 1800
 BACKUP_SAVE_INTERVAL_SEC = 36000
-POSITIONS_PER_EPOCH = 10_000_000  # 1エポックあたりの局面数（1億局面）
-SHUFFLE_BUFFER_SIZE = 50_000      # シャッフルバッファ（大きくするとより混ざる。50万件で約19MB）
+POSITIONS_PER_EPOCH = 100_000_000  # 1エポックあたりの局面数（1億局面）
+SHUFFLE_BUFFER_SIZE = 500_000      # シャッフルバッファ（大きくするとより混ざる。50万件で約19MB）
 CHUNK_SIZE          = 4096         # 1回のランダムアクセスで読み込む連続件数（IO速度担保）
 MAE_RATE            = 0.20
-SCORE_CUTLINE       = 10000
+SCORE_CUTLINE       = 3000  # 🚨 P1-1_bugfix: score_cpはint16(struct '<h')で±32767が上限のため、
+                            # 旧値100000では abs(score_cp) > SCORE_CUTLINE が常にFalseとなり
+                            # 実質不発だった(実測: 0%フィルタ)。詰み付近の極端スコアを除外する
+                            # 意図に沿って有効な値に修正(実測: 17.36%フィルタ)。
+                            # 🚨 P1-2: SCORE_CUTLINEのロジックには一切触れない(設計書§7の留保事項)。
+
+# ==========================================
+# 🎲 P1-2: Binned Value (HL-Gauss) 設定
+# ==========================================
+NUM_VALUE_BINS = 128
+_VALUE_BIN_EDGES = [i / NUM_VALUE_BINS for i in range(NUM_VALUE_BINS + 1)]
+_VALUE_BIN_SIGMA = 0.75 * (1.0 / NUM_VALUE_BINS)  # 設計書§4: ビン幅の0.75倍を初期値とする
+
+
+def _normal_cdf(x, loc, scale):
+    return 0.5 * (1.0 + math.erf((x - loc) / (scale * math.sqrt(2.0))))
+
+
+def make_hl_gauss_target(target_prob):
+    """
+    target_prob([0,1]のスカラー勝率ターゲット)を中心としたガウス分布を
+    NUM_VALUE_BINS個のビンに割り当て、正規化した確率分布(合計1)を返す。
+    (設計書§4 HL-Gauss。データローダー内でCPU側/pure pythonで計算する)
+    """
+    cdf = [_normal_cdf(edge, target_prob, _VALUE_BIN_SIGMA) for edge in _VALUE_BIN_EDGES]
+    probs = [cdf[i + 1] - cdf[i] for i in range(NUM_VALUE_BINS)]
+    total = sum(probs)
+    probs = [p / total for p in probs]  # 端の裾切れを正規化で補正
+    return torch.tensor(probs, dtype=torch.float32)
 
 # ==========================================
 # 🔌 ネットワーク動的ローダー
@@ -71,6 +112,34 @@ def get_network(network_path):
         sys.exit(1)
 
 # ==========================================
+# 🎛️ Optimizer param_groups (weight decay 分類)
+# ==========================================
+def build_param_groups(model, weight_decay):
+    """
+    🚨 P1-1_bugfix: 旧実装は名前の部分文字列 ('bias','norm','bn') で
+    no-decay判定していたが、nn.Sequential内でインデックス番号アクセスに
+    なるBatchNorm2d(例: stem.1, value_conv.1, mae_conv.1)は名前に
+    'bn'/'norm'が含まれず、weightが誤ってweight decay対象になっていた。
+    モジュール型(BatchNorm/LayerNorm/GroupNorm)で判定することで、
+    名前の付け方に依存せず正しくno-decay側に分類する。
+    """
+    decay_params = []
+    no_decay_params = []
+    norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm, nn.GroupNorm)
+
+    for module in model.modules():
+        for pname, p in module.named_parameters(recurse=False):
+            if isinstance(module, norm_types) or pname == 'bias':
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+    return [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0},
+    ]
+
+# ==========================================
 # 📉 ユーティリティ & スケジューラ
 # ==========================================
 def get_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps, eta_min_ratio=1e-3):
@@ -86,16 +155,6 @@ def estimate_dataset_size(data_dir, record_size=38):
     files = glob.glob(os.path.join(data_dir, "*.hcpe"))
     total_bytes = sum(os.path.getsize(f) for f in files)
     return total_bytes // record_size, len(files)
-
-# ==========================================
-# 🛠️ ビットボード展開関数
-# ==========================================
-def bb_to_squares(bb):
-    """整数のビットボードから、立っているビットの座標を返すジェネレータ"""
-    while bb > 0:
-        r = bb & -bb
-        yield r.bit_length() - 1
-        bb ^= r
 
 # ==========================================
 # 🎯 指し手変換 (dlshogi 2187次元方式)
@@ -146,88 +205,6 @@ def usi_to_action(usi):
     return dir_idx * 81 + to_sq
 
 # ==========================================
-# ⚡ 特徴量生成 (python-shogi 55ch版フル実装)
-# ==========================================
-def make_features_v16(board, is_white):
-    features = np.zeros((INPUT_CHANNELS, 9, 9), dtype=np.float32)
-    
-    # 1. 盤上の駒 (0-27)
-    for sq in range(81):
-        p = board.piece_at(sq)
-        if p:
-            if p.color == board.turn: # 手番側
-                idx = p.piece_type - 1
-            else: # 相手側
-                idx = p.piece_type - 1 + 14
-                
-            target_sq = (80 - sq) if is_white else sq
-            y, x = divmod(target_sq, 9)
-            features[idx, y, x] = 1.0
-
-    # 2. 持ち駒 (28-41)
-    piece_order = [shogi.PAWN, shogi.LANCE, shogi.KNIGHT, shogi.SILVER, shogi.GOLD, shogi.BISHOP, shogi.ROOK]
-    colors = [(board.turn, 28), (not board.turn, 35)]
-    for color, offset in colors:
-        hand = board.pieces_in_hand[color]
-        for i, p_type in enumerate(piece_order):
-            count = hand[p_type]
-            if count > 0:
-                features[offset + i, :, :] = count / 10.0
-
-    # 3. 大駒の利き (42-45)
-    for sq in range(81):
-        p = board.piece_at(sq)
-        if not p: continue
-        pt = p.piece_type
-        if pt not in [shogi.ROOK, shogi.PROM_ROOK, shogi.BISHOP, shogi.PROM_BISHOP]:
-            continue
-            
-        is_self = (p.color == board.turn)
-        is_rook = (pt == shogi.ROOK or pt == shogi.PROM_ROOK)
-        
-        if is_self: ch = 42 if is_rook else 43
-        else:       ch = 44 if is_rook else 45
-        
-        attacks_bb = board.attacks_from(pt, sq, board.occupied, p.color)
-        
-        for t_sq in bb_to_squares(attacks_bb):
-            target_sq = (80 - t_sq) if is_white else t_sq
-            y, x = divmod(target_sq, 9)
-            features[ch, y, x] = 1.0
-
-    # 4. 玉の周辺 (46-49)
-    k_sq_self = board.king_squares[board.turn]
-    k_sq_opp = board.king_squares[not board.turn]
-    kings = [(k_sq_self, 46), (k_sq_opp, 48)]
-    
-    for k_sq, base_ch in kings:
-        if k_sq is None: continue
-        ky, kx = divmod(k_sq, 9)
-        
-        for r, r_ch in [(3, 1), (2, 0)]:
-            for dy in range(-r, r+1):
-                for dx in range(-r, r+1):
-                    ny, nx = ky + dy, kx + dx
-                    if 0 <= ny < 9 and 0 <= nx < 9:
-                        orig_sq = ny * 9 + nx
-                        target_sq = (80 - orig_sq) if is_white else orig_sq
-                        ty, tx = divmod(target_sq, 9)
-                        features[base_ch + r_ch, ty, tx] = 1.0
-
-    # 5. その他 (50-54)
-    if board.is_check(): features[50, :, :] = 1.0
-    # ch51: 予約（白紙）
-    # features[51] は常に 0.0 のまま (エンジン側と整合済み)
-    
-    for i in range(9):
-        features[52, :, i] = i / 8.0  # File (筋: 0〜8)
-        features[53, i, :] = i / 8.0  # Rank (段: 0〜8)
-    # ch54: 予約（白紙）
-    # features[54] は常に 0.0 のまま (エンジン側と整合済み)
-        
-    return features
-
-# ==========================================
 # 🗂️ データセット (score_cpを出力に追加)
 # ==========================================
 class MultiFileHCPEDataset(IterableDataset):
@@ -243,20 +220,29 @@ class MultiFileHCPEDataset(IterableDataset):
     def _process_record(self, record, cb):
         hcp = np.frombuffer(record[:32], dtype=np.uint8).copy()
         score_cp = struct.unpack('<h', record[32:34])[0]
-        """
+
         if abs(score_cp) > SCORE_CUTLINE:
             return None
-        """
+
         move16 = struct.unpack('<H', record[34:36])[0]
-        result = record[36]
+
+        # 🚨 P1-2: record[36] (gameResult) 実機確認結果 (2026-08-17):
+        #   gameResult は符号付き1byte (struct '<b') だが、実際に取り得る値は
+        #   cshogi公式定数と完全一致する 0/1/2 のみ (負値は観測されない):
+        #     gameResult == cshogi.DRAW (0)       : 引き分け
+        #     gameResult == cshogi.BLACK_WIN (1)  : 先手勝ち
+        #     gameResult == cshogi.WHITE_WIN (2)  : 後手勝ち
+        #   検証: 実データ474,430,891局面中の1ファイル(約940万局面)で
+        #   値は{0,1,2}の3種のみ。さらに |score_cp|>=25000 の75,804局面で
+        #   score_cp>0(手番有利)と「手番側が最終的に勝利」の一致率100%
+        #   (不一致0件)を確認済み。score_cpは手番側視点で確定。
+        game_result = struct.unpack('<b', record[36:37])[0]
 
         cb.set_hcp(hcp)
         move_usi = cshogi.move_to_usi(move16)
         is_white = (cb.turn == cshogi.WHITE)
 
-        sfen = cb.sfen()
-        board = shogi.Board(sfen)
-        x = make_features_v16(board, is_white) # 既存の特徴量関数を呼び出す
+        x = features.make_features_v16_fast(cb, is_white)
         label = self._rotate_move(move_usi) if is_white else move_usi
 
         try:
@@ -264,22 +250,29 @@ class MultiFileHCPEDataset(IterableDataset):
         except ValueError:
             return None
 
-        if result == 1:   z = 0.0 if is_white else 1.0
-        elif result == 2: z = 1.0 if is_white else 0.0
-        else:             z = 0.5
-
         # 勝率 (BCEターゲット用)
         #win_rate = 1.0 / (1.0 + math.exp(-score_cp / 600.0))
-        #q = score_cp / 600.0
-        q = 1.0 / (1.0 + math.exp(-score_cp / 600.0))
+        target_logit = score_cp / 600.0
+        # Sigmoidを通して 0.0〜1.0 の「確率(勝率)」に変換する
+        target_prob = 1.0 / (1.0 + math.exp(max(min(-target_logit, 50.0), -50.0)))
 
-        target_v = 0.3 *z + 0.7 * q
+        # 🚨 P1-2: Result Head用ターゲット。手番視点で「この局面の手番側が
+        # 最終的に勝ったか」に統一する (設計書§3)
+        if game_result == cshogi.DRAW:
+            result_target = 0.5
+        elif game_result == cshogi.BLACK_WIN:
+            result_target = 1.0 if (cb.turn == cshogi.BLACK) else 0.0
+        else:  # cshogi.WHITE_WIN
+            result_target = 1.0 if (cb.turn == cshogi.WHITE) else 0.0
 
-        # 🚨 score_cp をそのまま返す (重み付け用)
+        soft_value_target = make_hl_gauss_target(target_prob)
+
         return (torch.from_numpy(x),
                 torch.tensor(move_id, dtype=torch.long),
-                torch.tensor(target_v, dtype=torch.float32),
-                torch.tensor(score_cp, dtype=torch.float32)) 
+                torch.tensor(target_prob, dtype=torch.float32),
+                torch.tensor(score_cp, dtype=torch.float32),
+                soft_value_target,
+                torch.tensor(result_target, dtype=torch.float32))
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -384,69 +377,97 @@ class ValidationDataset(IterableDataset):
                 hcp = np.frombuffer(record[:32], dtype=np.uint8).copy()
                 score_cp = struct.unpack('<h', record[32:34])[0]
                 move16 = struct.unpack('<H', record[34:36])[0]
-                result = record[36]
+                game_result = struct.unpack('<b', record[36:37])[0]  # 🚨 P1-2: §3参照
 
                 cb.set_hcp(hcp)
                 move_usi = cshogi.move_to_usi(move16)
                 is_white = (cb.turn == cshogi.WHITE)
 
-                sfen = cb.sfen()
-                board = shogi.Board(sfen)
-                x = make_features_v16(board, is_white)
+                x = features.make_features_v16_fast(cb, is_white)
 
                 if is_white: move_usi = self._rotate_move(move_usi)
 
                 try: move_id = usi_to_action(move_usi)
                 except ValueError: continue
 
-                if result == 1:   z = 0.0 if is_white else 1.0
-                elif result == 2: z = 1.0 if is_white else 0.0
-                else:             z = 0.5
-
                 #win_rate = 1.0 / (1.0 + math.exp(-score_cp / 600.0))
-                #q = score_cp / 600.0
-                q = 1.0 / (1.0 + math.exp(-score_cp / 600.0))
+                target_logit = score_cp / 600.0
 
-                target_v = 0.3 *z + 0.7 * q
+                # 🚨 P1-2: Result Head用ターゲット(手番視点、_process_recordと同一ロジック)
+                if game_result == cshogi.DRAW:
+                    result_target = 0.5
+                elif game_result == cshogi.BLACK_WIN:
+                    result_target = 1.0 if (cb.turn == cshogi.BLACK) else 0.0
+                else:  # cshogi.WHITE_WIN
+                    result_target = 1.0 if (cb.turn == cshogi.WHITE) else 0.0
 
                 yield (torch.from_numpy(x),
                        torch.tensor(move_id, dtype=torch.long),
-                       torch.tensor(target_v, dtype=torch.float32))
+                       torch.tensor(score_cp, dtype=torch.float32),
+                       torch.tensor(result_target, dtype=torch.float32))
                 count += 1
 
 def evaluate(model, val_loader):
-    model.eval() # 推論モード
+    """
+    🚨 P1-2: Binned Value + Result Head を持つネットワーク専用。
+    eval modeのforward()は (p, v_scalar, result_prob) の3値を返す前提。
+    value_loss_prob(勝率空間のMSE)は P1-0/P1-1と完全に同一定義のまま
+    維持している(設計書§6、比較可能性の生命線のため変更禁止)。
+    ロジット空間MSE(value_loss_v_logit)はBinned Valueでは定義できないため
+    廃止し、代わりにResult Headの正解率(引き分け局面は正誤判定から除外)を返す。
+    """
+    model.eval() # 🚨 推論モード（Valueには自動的にSigmoidがかかる）
     correct = 0
     total = 0
     val_loss_p = 0.0
-    val_loss_v_bce = 0.0 # 評価指標をBCEに統一
+    val_loss_v_prob = 0.0
+    result_correct = 0
+    result_total = 0
     batch_count = 0
 
     criterion_p = nn.CrossEntropyLoss()
-    criterion_v = nn.BCELoss() # 評価時は普通のBCE
+    criterion_v = nn.MSELoss()
 
     with torch.no_grad():
-        for x, t_m, t_v in val_loader: # t_v はすでに 0.0~1.0 の確率
-            x, t_m, t_v = x.to(DEVICE), t_m.to(DEVICE), t_v.to(DEVICE)
-            
-            p, v = model(x)
-            
-            # 1. Policy 精度と Loss
+        for x, t_m, t_score, result_target in val_loader:
+            x = x.to(DEVICE)
+            t_m = t_m.to(DEVICE)
+            t_score = t_score.to(DEVICE)
+            result_target = result_target.to(DEVICE)
+
+            # p: ロジット(2187), v_scalar: 勝率(0.0~1.0), result_prob: 勝率(Result Head)
+            p, v_scalar, result_prob = model(x)
+
+            # 1. Policy 精度と Loss (CrossEntropy)
             pred_move = p.argmax(1)
             correct += (pred_move == t_m).sum().item()
             total += t_m.size(0)
             val_loss_p += criterion_p(p, t_m).item()
-            
-            # 2. Value Loss計算 (BCE)
-            # v は推論モードなので自動的にSigmoidがかかっている
-            val_loss_v_bce += criterion_v(v.squeeze(), t_v).item()
+
+            # 2. 正解データの作成 (水匠定数600)
+            t_v_logit = t_score / 600.0
+            t_v_prob = 1.0 / (1.0 + torch.exp(-t_v_logit))
+
+            # 3. Value Loss計算: 勝率空間のMSE (🚨 P1-0/P1-1と同一定義、変更禁止)
+            val_loss_v_prob += criterion_v(v_scalar.squeeze(), t_v_prob).item()
+
+            # 4. Result Headの正解率 (引き分け(0.5)は正誤判定の対象外)
+            decisive_mask = (result_target != 0.5)
+            if decisive_mask.any():
+                pred_result = (result_prob.squeeze() > 0.5).float()
+                result_correct += (pred_result[decisive_mask] == result_target[decisive_mask]).sum().item()
+                result_total += decisive_mask.sum().item()
+
             batch_count += 1
-            
+
     acc = correct / total if total > 0 else 0
     avg_loss_p = val_loss_p / batch_count if batch_count > 0 else 0
-    avg_loss_v_bce = val_loss_v_bce / batch_count if batch_count > 0 else 0
-    
-    return acc, avg_loss_p, avg_loss_v_bce
+    avg_loss_v_prob = val_loss_v_prob / batch_count if batch_count > 0 else 0
+    # 🚨 P1-2: ロジット空間MSEはBinned Valueでは定義不可のため廃止(常に0.0のプレースホルダ)
+    avg_loss_v_logit_deprecated = 0.0
+    result_acc = result_correct / result_total if result_total > 0 else 0
+
+    return acc, avg_loss_p, avg_loss_v_logit_deprecated, avg_loss_v_prob, result_acc
 
 def plot_learning_curve(loss_history, save_path):
     if not loss_history: return
@@ -466,35 +487,35 @@ def plot_learning_curve(loss_history, save_path):
 def train(args):
     os.makedirs("model", exist_ok=True)
     
+    data_dir = getattr(args, "data_dir", None) or DATA_DIR
+    test_data_dir = getattr(args, "val_dir", None) or TEST_DATA_DIR
+
     # 全体容量の推定は情報として残す
-    total_records, num_files = estimate_dataset_size(DATA_DIR)
+    total_records, num_files = estimate_dataset_size(data_dir)
     
     # 🚨 学習の基準を POSITIONS_PER_EPOCH (1億) に固定する
     actual_positions_per_epoch = min(total_records, POSITIONS_PER_EPOCH)
     total_batches_per_epoch = actual_positions_per_epoch // PHYSICAL_BATCH_SIZE
-    total_opt_steps_per_epoch = total_batches_per_epoch // ACCUM_STEPS
-    total_opt_steps = total_opt_steps_per_epoch * EPOCHS
-    
+    # 🚨 P1-5: total_opt_stepsはEPOCHSベースの計算式ではなく、実測に基づく
+    # 固定値TOTAL_OPT_STEPSをスケジューラの前提として用いる
+    total_opt_steps = TOTAL_OPT_STEPS
+
     print(f"[INFO] 全データ: {num_files} ファイル / 推定 {total_records:,} 局面")
     print(f"[INFO] 1エポックの学習サイズ: {actual_positions_per_epoch:,} 局面")
-    print(f"[INFO] 総最適化ステップ数: {total_opt_steps:,} ステップ")
+    print(f"[INFO] 総最適化ステップ数(スケジューラ用固定値): {total_opt_steps:,} ステップ")
 
     # データローダー
     NUM_WORKERS = 4
-    dataset = MultiFileHCPEDataset(DATA_DIR)
+    dataset = MultiFileHCPEDataset(data_dir)
     loader = DataLoader(dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=NUM_WORKERS, persistent_workers=(NUM_WORKERS>0))
-    val_dataset = ValidationDataset(TEST_DATA_DIR)
+    val_dataset = ValidationDataset(test_data_dir)
     val_loader = DataLoader(val_dataset, batch_size=PHYSICAL_BATCH_SIZE, num_workers=0)
 
     # 🚀 ネットワークの動的ロード
     model = get_network(args.network).to(DEVICE)
 
     # Optimizer & Scheduler
-    _no_decay_kw = ('bias', 'norm', 'bn')
-    param_groups = [
-        {'params': [p for n, p in model.named_parameters() if not any(kw in n for kw in _no_decay_kw)], 'weight_decay': WEIGHT_DECAY},
-        {'params': [p for n, p in model.named_parameters() if any(kw in n for kw in _no_decay_kw)], 'weight_decay': 0.0},
-    ]
+    param_groups = build_param_groups(model, WEIGHT_DECAY)
     optimizer = optim.AdamW(param_groups, lr=LEARNING_RATE)
     scheduler = get_warmup_cosine_scheduler(optimizer, WARMUP_STEPS, total_opt_steps, ETA_MIN_RATIO)
 
@@ -510,9 +531,9 @@ def train(args):
         model.to(DEVICE)
         
         if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
-        #if 'scheduler' in ckpt: scheduler.load_state_dict(ckpt['scheduler'])
-        #if 'epoch' in ckpt: start_epoch = ckpt['epoch']
-        #if 'global_step' in ckpt: start_global_step = ckpt['global_step']
+        if 'scheduler' in ckpt: scheduler.load_state_dict(ckpt['scheduler'])
+        if 'epoch' in ckpt: start_epoch = ckpt['epoch']
+        if 'global_step' in ckpt: start_global_step = ckpt['global_step']
         print(f"[OK] Epoch {start_epoch+1}, 累積 {start_global_step} ステップから再開します。")
 
     last_save_time = time.time()
@@ -529,7 +550,7 @@ def train(args):
         step_count = 0
         running_loss = 0.0
 
-        for i, (x, t_m, t_v, t_score) in enumerate(pbar):
+        for i, (x, t_m, t_v, t_score, soft_value_target, result_target) in enumerate(pbar):
             batch_count += 1
             """
             # 🚨 完全レジューム処理 (過去のステップまで空読みスキップ)
@@ -541,32 +562,26 @@ def train(args):
             """
             x = x.to(DEVICE)
             t_m = t_m.to(DEVICE)
-            t_v = t_v.to(DEVICE)
             t_score = t_score.to(DEVICE)
+            soft_value_target = soft_value_target.to(DEVICE)
+            result_target = result_target.to(DEVICE)
 
-            # 🎯 ターゲットスムージング (MSEでは不要ですが、あっても無害なので残してもOK)
-            #t_v = torch.clamp(t_v, min=0.005, max=0.995)
-
-            # Forward (🚨 訓練時は p, v に加えて x_hat が返ってくる)
-            # 隠された masked_x を入力し、モデルに元の x を想像させる
-            p, v, x_hat = model(x)
-            p = torch.clamp(p, min=-10.0, max=10.0)
+            # Forward (🚨 P1-2: Binned Value + Result Head。訓練時は
+            # (p, value_logits[B,NUM_VALUE_BINS], result_logit[B,1]) を返す)
+            p, value_logits, result_logit = model(x)
+            # 🚨 P1-1_bugfix: policyロジットのclamp(-10,10)を撤廃
+            # (勾配を不必要に歪める可能性があるため)
 
             # --- ⚔️ Loss 計算 ---
-            # 1. Policy Loss
-            loss_p = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)(p, t_m)
-            
-            # 2. Value Loss (🚨 BCEから、生ロジット同士のMSELossに変更！)
-            mse_loss = nn.MSELoss(reduction='none')(v.squeeze(), t_v)
-            weight_v = torch.where(torch.abs(t_score) <= 2000, 2.0, 0.2)
-            #loss_v = (mse_loss * weight_v).mean() * VALUE_LOSS_SCALE
-            loss_v = nn.BCEWithLogitsLoss()(v.squeeze(), t_v) * VALUE_LOSS_SCALE
+            # 1. Policy Loss (🚨 P1-1_bugfix: label_smoothing 0.1 -> 0.03)
+            loss_p = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.03)(p, t_m)
 
-            # 3. MAE Loss (🚨 隠された入力から、元の完璧な盤面 x を復元させるMSE)
-            loss_mae = nn.MSELoss()(x_hat, x) * 2.0 # スケール調整
+            # 2. Value Loss (🚨 P1-2: Binned Value(HL-Gauss, CE) + Result Head(BCE) を混合)
+            loss_v_binned = -(soft_value_target * torch.log_softmax(value_logits, dim=-1)).sum(dim=-1).mean()
+            loss_v_result = nn.BCEWithLogitsLoss()(result_logit.squeeze(), result_target)
+            loss_v = (VALUE_MIX_LAMBDA * loss_v_binned + (1 - VALUE_MIX_LAMBDA) * loss_v_result) * VALUE_LOSS_SCALE
 
-            # 🚨 3つのLossを合算
-            loss = (loss_p + loss_v + loss_mae) / ACCUM_STEPS
+            loss = (loss_p + loss_v) / ACCUM_STEPS
             loss.backward()
 
             if batch_count % ACCUM_STEPS == 0:
@@ -587,7 +602,8 @@ def train(args):
                     "Loss": f"{current_loss:.4f}",
                     "L_p": f"{loss_p.item():.4f}",
                     "L_v": f"{loss_v.item():.4f}",
-                    "L_m": f"{loss_mae.item():.4f}",
+                    "L_vbin": f"{loss_v_binned.item():.4f}",
+                    "L_vres": f"{loss_v_result.item():.4f}",
                     "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
                 })
 
@@ -596,8 +612,8 @@ def train(args):
                 if current_time - last_save_time > SAVE_INTERVAL_SEC:
                     
                     # 🚨 追加: テスト評価の実行
-                    acc, val_loss_p, val_loss_v_bce = evaluate(model, val_loader)
-                    print(f"\n[EVAL] Policy精度: {acc:.2%}, Policy Loss: {val_loss_p:.4f}, Value BCE Loss: {val_loss_v_bce:.5f}")
+                    acc, val_loss_p, _val_loss_v_logit_deprecated, val_loss_v_prob, result_acc = evaluate(model, val_loader)
+                    print(f"\n[EVAL] Policy精度: {acc:.2%}, Policy Loss: {val_loss_p:.4f}, Value MSE(勝率): {val_loss_v_prob:.5f}, Result Head精度: {result_acc:.2%}")
                     model.train() # 評価が終わったら必ず訓練モード(生ロジット出力)に戻す
                     
                     # 🚨 追加: グラフの保存
@@ -624,20 +640,22 @@ def train(args):
                         last_backup_time = current_time
 
             # 🛠️ 対Windows メモリリーク防御
-            del p, v, x_hat, loss_p, mse_loss, loss_v, loss_mae, loss
+            del p, value_logits, result_logit, loss_p, loss_v, loss_v_binned, loss_v_result, loss
             gc_counter += 1
             if gc_counter % 100 == 0:
                 import gc
                 gc.collect()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dainagon SOTA Training Script")
+    parser = argparse.ArgumentParser(description="Dainagon Training Script (ROCm)")
     parser.add_argument(
         "--network", 
         type=str, 
-        default="network.network_chunagon_v25_2.ChunagonNetV3",
-        help="ロードするネットワークのパス (例: network.network_chunagon_v25.ChunagonNetV3)"
+        default="network.network_chunagon_v28.ChunagonNetV3",
+        help="ロードするネットワークのパス (例: network.network_chunagon_v28.ChunagonNetV3)"
     )
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR, help="訓練データのディレクトリパス (デフォルト: ./data/traindata)")
+    parser.add_argument("--val-dir", type=str, default=TEST_DATA_DIR, help="検証データのディレクトリパス (デフォルト: ./data/train_test)")
     parser.add_argument("--resume", action="store_true", help="チェックポイントから再開する")
     args = parser.parse_args()
 

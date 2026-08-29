@@ -88,14 +88,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--network", 
         type=str, 
-        default="network.network_chunagon_v28.ChunagonNetV3",
+        default="network.network_chunagon_v30.ChunagonNetV3",
         help="対象ネットワーククラスパス"
     )
     # 🚨 パス指定から「名前指定」に変更
     parser.add_argument(
         "--name", 
         type=str, 
-        default="chunagon_v28",
+        default="chunagon_v30",
         help="モデルファイル名（拡張子 .pt なし、model/ フォルダ内から自動検索）"
     )
     parser.add_argument(

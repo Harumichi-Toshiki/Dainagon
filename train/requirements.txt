@@ -1,0 +1,5 @@
+torch>=2.4.0
+cshogi>=0.9.7
+numpy>=1.26.0
+tqdm>=4.66.0
+matplotlib>=3.8.0

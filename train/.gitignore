@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data & Models
+data/
+*.hcpe
+model/*.pt
+model/*.onnx
+model/checkpoints/
+model/_smoke_test_checkpoint.pt
+
+# Logs & Benchmark artifacts
+model/logs/
+*.png
+tunableop_results*.csv
